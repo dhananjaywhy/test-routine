@@ -19,6 +19,8 @@ import requests
 import urllib3
 urllib3.disable_warnings()
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from urllib.parse import urlparse
 from google.oauth2 import service_account
 import google.auth.transport.requests
@@ -35,6 +37,7 @@ USER_AGENT = (
 
 TIMEOUT = 10
 RETRY_WAIT = 5
+MAX_WORKERS = 20
 
 
 class NoVerifySession(requests.Session):
@@ -231,6 +234,59 @@ def col_letter_to_index(letter):
     return ord(letter) - ord("A")
 
 
+def process_row(sheet_row, row):
+    """Returns (sheet_row, updates_list, rec_or_None, error_or_None)."""
+    row = row + [""] * (9 - len(row))  # pad to D..L (9 columns)
+    source_url = row[0].strip()   # D
+    source_domain = row[2].strip()  # F
+    target_url = row[3].strip()  # G
+    existing_h = row[4].strip()  # H
+    existing_i = row[5].strip()  # I
+    existing_j = row[6].strip()  # J
+    existing_k = row[7].strip()  # K
+    existing_l = row[8].strip()  # L
+
+    try:
+        src_status, src_redirected = check_url(source_url) if source_url else ("NOT REACHABLE", False)
+
+        domain_check_url = normalize_domain_url(source_domain) if source_domain else None
+        dom_status, _dom_redirected = check_url(domain_check_url) if domain_check_url else ("NOT REACHABLE", False)
+
+        tgt_status, tgt_redirected = check_url(target_url) if target_url else ("NOT REACHABLE", False)
+
+        src_display = src_status + (" (redirected)" if src_status == "LIVE" and src_redirected else "")
+        tgt_display = tgt_status + (" (redirected)" if tgt_status == "LIVE" and tgt_redirected else "")
+        dom_display = dom_status
+
+        rec = determine_recoverability(src_status, dom_status, tgt_status)
+        reason = build_reason(src_status, dom_status, tgt_status, rec,
+                               src_redirected, tgt_redirected)
+
+        new_values = {
+            "H": src_display,
+            "I": dom_display,
+            "J": tgt_display,
+            "K": rec,
+            "L": reason,
+        }
+        existing_values = {
+            "H": existing_h,
+            "I": existing_i,
+            "J": existing_j,
+            "K": existing_k,
+            "L": existing_l,
+        }
+
+        row_updates = [
+            {"range": f"'{TAB}'!{col}{sheet_row}", "values": [[new_val]]}
+            for col, new_val in new_values.items()
+            if existing_values[col] != new_val
+        ]
+        return sheet_row, row_updates, rec, None
+    except Exception as e:
+        return sheet_row, [], None, str(e)
+
+
 def main():
     sess, token = get_sheets_client()
 
@@ -247,72 +303,37 @@ def main():
 
     updates = []  # list of {"range":..., "values": [[...]]}
 
+    work_items = []
     for i, row in enumerate(rows):
         sheet_row = i + 2  # row 2 = first data row
-
-        row = row + [""] * (9 - len(row))  # pad to D..L (9 columns)
-        source_url = row[0].strip()   # D
-        source_domain = row[2].strip()  # F
-        target_url = row[3].strip()  # G
-        existing_h = row[4].strip()  # H
-        existing_i = row[5].strip()  # I
-        existing_j = row[6].strip()  # J
-        existing_k = row[7].strip()  # K
-        existing_l = row[8].strip()  # L
-
-        if not source_url and not source_domain and not target_url:
+        padded = row + [""] * (9 - len(row))
+        if not padded[0].strip() and not padded[2].strip() and not padded[3].strip():
+            skipped.append((sheet_row, "D, F, and G all empty"))
             continue
+        work_items.append((sheet_row, row))
 
-        total_processed += 1
+    total_processed = len(work_items)
+    print(f"Checking {total_processed} rows with {MAX_WORKERS} concurrent workers...")
 
-        try:
-            src_status, src_redirected = check_url(source_url) if source_url else ("NOT REACHABLE", False)
-
-            domain_check_url = normalize_domain_url(source_domain) if source_domain else None
-            dom_status, _dom_redirected = check_url(domain_check_url) if domain_check_url else ("NOT REACHABLE", False)
-
-            tgt_status, tgt_redirected = check_url(target_url) if target_url else ("NOT REACHABLE", False)
-
-            src_display = src_status + (" (redirected)" if src_status == "LIVE" and src_redirected else "")
-            tgt_display = tgt_status + (" (redirected)" if tgt_status == "LIVE" and tgt_redirected else "")
-            dom_display = dom_status
-
-            rec = determine_recoverability(src_status, dom_status, tgt_status)
-            reason = build_reason(src_status, dom_status, tgt_status, rec,
-                                   src_redirected, tgt_redirected)
-
-            if rec == "YES":
-                count_yes += 1
-            elif rec == "NO":
-                count_no += 1
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(process_row, sheet_row, row) for sheet_row, row in work_items]
+        for future in as_completed(futures):
+            sheet_row, row_updates, rec, error = future.result()
+            done_count += 1
+            if error:
+                failed.append((sheet_row, error))
             else:
-                count_na += 1
-
-            new_values = {
-                "H": src_display,
-                "I": dom_display,
-                "J": tgt_display,
-                "K": rec,
-                "L": reason,
-            }
-            existing_values = {
-                "H": existing_h,
-                "I": existing_i,
-                "J": existing_j,
-                "K": existing_k,
-                "L": existing_l,
-            }
-
-            for col, new_val in new_values.items():
-                if existing_values[col] != new_val:
-                    updates.append({
-                        "range": f"'{TAB}'!{col}{sheet_row}",
-                        "values": [[new_val]],
-                    })
-                    total_updated_cells += 1
-
-        except Exception as e:
-            failed.append((sheet_row, str(e)))
+                updates.extend(row_updates)
+                total_updated_cells += len(row_updates)
+                if rec == "YES":
+                    count_yes += 1
+                elif rec == "NO":
+                    count_no += 1
+                else:
+                    count_na += 1
+            if done_count % 25 == 0 or done_count == total_processed:
+                print(f"  progress: {done_count}/{total_processed} rows checked")
 
     if updates:
         # batchUpdate limits payload size; chunk to be safe
