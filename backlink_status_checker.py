@@ -216,7 +216,8 @@ def build_reason(src, dom, tgt, rec, src_redirected, tgt_redirected):
     elif rec == "N/A":
         reason = "Already live and working"
     else:
-        reason = f"Source={src}, Domain={dom}, Target={tgt} — {rec.lower()} recoverable based on best judgment"
+        verdict = "recoverable" if rec == "YES" else "not recoverable"
+        reason = f"Source={src}, Domain={dom}, Target={tgt} — {verdict} based on best judgment"
 
     tags = []
     if src_redirected:
